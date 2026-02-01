@@ -1,2 +1,2 @@
 # SAM-Finetuning for Carbonate Textural Component Segmentation
-This repository contains the code for fine-tuning the Segment Anything Model (SAM) to segment and quantify five key carbonate textural components (Grain, Cement, Matrix, Primary Pore, Dissolved Pore) from plane-polarized light photomicrographs — corresponding to the statement: *"The SAM was employed to segment and quantify textural components in 2,260 plane-polarized light photomicrographs derived from 414 core samples."*
+This repository contains the code for fine-tuning the Segment Anything Model (SAM) to segment and quantify five key carbonate textural components (Grain, Cement, Matrix, Primary Pore, Dissolved Pore) from plane-polarized light photomicrographs*
