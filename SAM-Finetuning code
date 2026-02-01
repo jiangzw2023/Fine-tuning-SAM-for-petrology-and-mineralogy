@@ -1,0 +1,704 @@
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from segment_anything import sam_model_registry, SamPredictor
+import albumentations as A
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+import warnings
+from torch.cuda.amp import autocast, GradScaler
+from collections import Counter
+
+warnings.filterwarnings("ignore")
+
+
+class Config:
+    SAM_TYPE = "vit_b"
+    SAM_CKPT = "sam_vit_b_01ec64.pth"  
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    
+
+    TRAIN_IMG_DIR = r"D:\Segment_anything\data\internal\images"
+    TRAIN_MASK_DIR = r"D:\Segment_anything\data\internal\masks_expert_annotated"
+    VAL_RATIO = 0.2
+    EXTERNAL_DATASETS = [
+        r"D:\Segment_anything\data\external\dataset_nanhua",
+        r"D:\Segment_anything\data\external\dataset2_nanjing",
+        r"D:\Segment_anything\data\external\dataset3_taxibei"
+    ]
+    
+
+    CLASS_MAP = {
+        "Grain": 1,
+        "Cement": 2,
+        "Matrix": 3,
+        "Primary Pore": 4,
+        "Dissolved Pore": 5
+    }
+    NUM_CLASSES = len(CLASS_MAP) + 1  
+    
+
+    BATCH_SIZE = 1  
+    LEARNING_RATE = 1e-5  
+    WEIGHT_DECAY = 1e-3
+    EPOCHS = 30
+    PATIENCE = 15
+    IMG_SIZE = 1024  
+    GRAD_CLIP = 1.0
+    USE_AUG = True
+    AUG_PROB = 0.5
+    FREEZE_IMAGE_ENCODER = False  
+    IMAGE_ENCODER_LR_FACTOR = 0.1  
+    
+  
+    SAVE_DIR = r"D:\Segment_anything\finetuned_models"
+    BEST_MODEL_NAME = "sam_finetuned_best_iou_vitb_1024.pth"
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+
+class RockSegmentDataset(Dataset):
+    def __init__(self, img_paths, mask_paths, config, transform=None):
+        self.img_paths = img_paths
+        self.mask_paths = mask_paths
+        self.config = config
+        self.transform = transform
+        self.class_map = config.CLASS_MAP
+        
+    def __len__(self):
+        return len(self.img_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.img_paths[idx]
+        mask_path = self.mask_paths[idx]
+        
+        try:
+            # Read image
+            img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError(f"Image reading failed: {img_path}")
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Read mask
+            mask = cv2.imdecode(np.fromfile(mask_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise ValueError(f"Mask reading failed: {mask_path}")
+            img = cv2.resize(img, (self.config.IMG_SIZE, self.config.IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+            mask = cv2.resize(mask, (self.config.IMG_SIZE, self.config.IMG_SIZE), interpolation=cv2.INTER_NEAREST)
+            
+            # Apply data augmentation
+            if self.transform:
+                augmented = self.transform(image=img, mask=mask)
+                img = augmented["image"]
+                mask = augmented["mask"]
+            
+            # Convert to tensor
+            img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            mask = torch.from_numpy(mask).long()
+            
+            point_coords = []
+            point_labels = []
+            
+            # Filter valid classes (area > 100 pixels)
+            valid_cls = []
+            for cls in range(1, self.config.NUM_CLASSES):
+                cls_mask = (mask == cls).numpy()
+                if np.sum(cls_mask) > 100:  # Filter small regions
+                    valid_cls.append(cls)
+            
+            # Generate positive points (up to 3 per class, max 3 classes)
+            np.random.seed(42)  # Fixed seed for reproducibility
+            for cls in valid_cls[:3]:  # Max 3 classes for prompt points
+                cls_mask = (mask == cls).numpy()
+                y_coords, x_coords = np.where(cls_mask)
+                
+                # Randomly select points
+                if len(y_coords) >= 3:
+                    rand_indices = np.random.choice(len(y_coords), 3, replace=False)
+                else:
+                    rand_indices = np.arange(len(y_coords))
+                
+                for idx_rand in rand_indices:
+                    point_coords.append([x_coords[idx_rand], y_coords[idx_rand]])
+                    point_labels.append(1)
+            
+            # Generate negative points (background)
+            bg_mask = (mask == 0).numpy()
+            y_bg, x_bg = np.where(bg_mask)
+            if len(y_bg) > 0 and len(point_coords) > 0:
+                neg_points_num = min(len(point_coords), len(y_bg))
+                rand_bg_indices = np.random.choice(len(y_bg), neg_points_num, replace=False)
+                
+                for idx_bg in rand_bg_indices:
+                    point_coords.append([x_bg[idx_bg], y_bg[idx_bg]])
+                    point_labels.append(0)
+            
+            # Default point if no valid points
+            if len(point_coords) == 0:
+                point_coords = [[self.config.IMG_SIZE//2, self.config.IMG_SIZE//2]]
+                point_labels = [1]
+            
+            # Reshape points
+            point_coords = np.array(point_coords, dtype=np.float32).reshape(-1, 2)
+            point_labels = np.array(point_labels, dtype=np.int32).reshape(-1,)
+            
+            if idx % 50 == 0:
+                print(f"📌 Sample {os.path.basename(img_path)} | Number of prompt points: {len(point_coords)} | Input size: {self.config.IMG_SIZE}×{self.config.IMG_SIZE}")
+            
+            return {
+                "image": img.to(self.config.DEVICE),
+                "mask": mask.to(self.config.DEVICE),
+                "point_coords": torch.from_numpy(point_coords).to(self.config.DEVICE),
+                "point_labels": torch.from_numpy(point_labels).to(self.config.DEVICE),
+                "img_path": img_path
+            }
+        except Exception as e:
+            print(f"⚠️  Sample {os.path.basename(img_path)} processing failed: {str(e)}")
+            # Return empty tensor for failed samples
+            img = torch.zeros(3, self.config.IMG_SIZE, self.config.IMG_SIZE).float().to(self.config.DEVICE)
+            mask = torch.zeros(self.config.IMG_SIZE, self.config.IMG_SIZE).long().to(self.config.DEVICE)
+            point_coords = torch.tensor([[self.config.IMG_SIZE//2, self.config.IMG_SIZE//2]]).float().to(self.config.DEVICE)
+            point_labels = torch.tensor([1]).int().to(self.config.DEVICE)
+            
+            return {
+                "image": img,
+                "mask": mask,
+                "point_coords": point_coords,
+                "point_labels": point_labels,
+                "img_path": img_path
+            }
+
+
+def get_transforms(config):
+    train_transform = A.Compose([
+        A.HorizontalFlip(p=config.AUG_PROB),
+        A.VerticalFlip(p=config.AUG_PROB),
+        A.RandomRotate90(p=config.AUG_PROB),
+        A.GaussianBlur(blur_limit=(3, 7), p=0.4),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.4),
+        A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=10, p=0.3),
+        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=10, p=0.3),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), max_pixel_value=255.0)
+    ]) if config.USE_AUG else A.Compose([
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), max_pixel_value=255.0)
+    ])
+    
+    val_transform = A.Compose([
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), max_pixel_value=255.0)
+    ])
+    
+    return train_transform, val_transform
+
+
+def load_data(config):
+    if not os.path.exists(config.TRAIN_IMG_DIR):
+        raise FileNotFoundError(f"Training image directory does not exist: {config.TRAIN_IMG_DIR}")
+    if not os.path.exists(config.TRAIN_MASK_DIR):
+        raise FileNotFoundError(f"Training mask directory does not exist: {config.TRAIN_MASK_DIR}")
+    
+    img_paths = []
+    mask_paths = []
+    
+    for img_name in os.listdir(config.TRAIN_IMG_DIR):
+        if not img_name.lower().endswith((".jpg", ".png", ".jpeg")):
+            continue
+        img_path = os.path.join(config.TRAIN_IMG_DIR, img_name)
+        mask_prefix = os.path.splitext(img_name)[0]
+        mask_candidates = [f for f in os.listdir(config.TRAIN_MASK_DIR) if f.startswith(mask_prefix) and f.endswith(".png")]
+        
+        if mask_candidates:
+            mask_paths.append(os.path.join(config.TRAIN_MASK_DIR, mask_candidates[0]))
+            img_paths.append(img_path)
+    
+    print(f"📥 Loaded valid samples: {len(img_paths)}")
+    train_imgs, val_imgs, train_masks, val_masks = train_test_split(
+        img_paths, mask_paths, test_size=config.VAL_RATIO, random_state=42
+    )
+    
+    print(f"   - Training set: {len(train_imgs)} samples")
+    print(f"   - Validation set: {len(val_imgs)} samples")
+    
+    train_transform, val_transform = get_transforms(config)
+    train_dataset = RockSegmentDataset(train_imgs, train_masks, config, train_transform)
+    val_dataset = RockSegmentDataset(val_imgs, val_masks, config, val_transform)
+    
+    train_loader = DataLoader(
+        train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=False
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False
+    )
+    
+    return train_loader, val_loader
+
+class SAMFineTuner:
+    def __init__(self, config):
+        self.config = config
+        self.best_val_iou = 0.0
+        self.epochs_no_improve = 0
+        
+        # Load SAM pretrained weights
+        if not os.path.exists(config.SAM_CKPT):
+            raise FileNotFoundError(
+                f"SAM checkpoint file does not exist: {config.SAM_CKPT}\n"
+                "Download link: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+            )
+        
+        # Initialize SAM model
+        self.sam = sam_model_registry[config.SAM_TYPE](checkpoint=config.SAM_CKPT)
+        self.sam.to(config.DEVICE)
+        
+        # Freeze image encoder if needed
+        if config.FREEZE_IMAGE_ENCODER:
+            # Freeze image encoder parameters
+            for name, param in self.sam.named_parameters():
+                if "image_encoder" in name:
+                    param.requires_grad = False
+                else:
+                    param.requires_grad = True
+        else:
+            # Unfreeze all parameters
+            for name, param in self.sam.named_parameters():
+                param.requires_grad = True
+        
+        # Add multi-class classification head
+        self.class_head = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, config.NUM_CLASSES, kernel_size=1, padding=0),
+            nn.Upsample(size=(config.IMG_SIZE, config.IMG_SIZE), mode='bilinear', align_corners=False)
+        ).to(config.DEVICE)
+        
+        # Calculate class weights (address class imbalance)
+        self.class_weights = self._calculate_class_weights()
+        self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights, ignore_index=0)
+        
+        # Configure optimizer
+        if config.FREEZE_IMAGE_ENCODER:
+            # Only optimize unfrozen parameters
+            trainable_params = list(filter(lambda p: p.requires_grad, self.sam.parameters())) + list(self.class_head.parameters())
+            self.optimizer = optim.AdamW(
+                trainable_params,
+                lr=config.LEARNING_RATE,
+                weight_decay=config.WEIGHT_DECAY
+            )
+        else:
+            # Different learning rates for different parameter groups
+            param_groups = [
+                # Image encoder (lower learning rate)
+                {
+                    'params': [p for n, p in self.sam.named_parameters() if "image_encoder" in n and p.requires_grad],
+                    'lr': config.LEARNING_RATE * config.IMAGE_ENCODER_LR_FACTOR
+                },
+                # Other SAM parameters
+                {
+                    'params': [p for n, p in self.sam.named_parameters() if "image_encoder" not in n and p.requires_grad],
+                    'lr': config.LEARNING_RATE
+                },
+                # Classification head
+                {
+                    'params': self.class_head.parameters(),
+                    'lr': config.LEARNING_RATE
+                }
+            ]
+            self.optimizer = optim.AdamW(
+                param_groups,
+                weight_decay=config.WEIGHT_DECAY
+            )
+        
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=config.EPOCHS, eta_min=1e-7)
+        self.scaler = GradScaler() if config.DEVICE == "cuda" else None
+    
+    def _calculate_class_weights(self):
+        """Calculate class weights based on training data (address class imbalance)"""
+        try:
+            # Count pixel distribution of each class
+            class_counts = Counter()
+            img_paths = []
+            mask_paths = []
+            
+            for img_name in os.listdir(self.config.TRAIN_IMG_DIR):
+                if img_name.lower().endswith((".jpg", ".png", ".jpeg")):
+                    img_path = os.path.join(self.config.TRAIN_IMG_DIR, img_name)
+                    mask_prefix = os.path.splitext(img_name)[0]
+                    mask_candidates = [f for f in os.listdir(self.config.TRAIN_MASK_DIR) if f.startswith(mask_prefix) and f.endswith(".png")]
+                    if mask_candidates:
+                        mask_paths.append(os.path.join(self.config.TRAIN_MASK_DIR, mask_candidates[0]))
+                        img_paths.append(img_path)
+            
+            # Sample first 50 masks for efficiency
+            for mask_path in mask_paths[:50]:  
+                mask = cv2.imdecode(np.fromfile(mask_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+                if mask is not None:
+                    mask = cv2.resize(mask, (self.config.IMG_SIZE, self.config.IMG_SIZE), interpolation=cv2.INTER_NEAREST)
+                    class_counts.update(mask.flatten())
+            
+            # Calculate inverse frequency weights
+            total_pixels = sum(class_counts.values())
+            weights = torch.ones(self.config.NUM_CLASSES).to(self.config.DEVICE)
+            
+            for cls in range(self.config.NUM_CLASSES):
+                count = class_counts.get(cls, 1)
+                weights[cls] = total_pixels / (self.config.NUM_CLASSES * count)
+            
+            # Normalize weights
+            weights = weights / weights.max()
+            print(f"📊 Calculated class weights: {weights.cpu().numpy()}")
+            return weights
+        except:
+            # Default weights if calculation fails
+            return torch.tensor([1.0, 2.0, 2.0, 2.0, 3.0, 3.0]).to(self.config.DEVICE)
+    
+    def _multiclass_dice_loss(self, pred, target, smooth=1e-6):
+        """Multi-class DiceLoss (robust version)"""
+        loss = 0.0
+        valid_cls = 0
+        for cls in range(1, self.config.NUM_CLASSES):
+            pred_cls = torch.softmax(pred, dim=1)[:, cls, :, :]
+            target_cls = (target == cls).float()
+            
+            if torch.sum(target_cls) < 10:  # Filter extremely small regions
+                continue
+            
+            intersection = (pred_cls * target_cls).sum()
+            union = pred_cls.sum() + target_cls.sum()
+            loss += 1 - (2. * intersection + smooth) / (union + smooth)
+            valid_cls += 1
+        
+        return loss / max(valid_cls, 1)
+    
+    def _calculate_metrics(self, pred, target):
+        """Calculate IoU/F1/FPR/FNR"""
+        pred = torch.argmax(pred, dim=1)
+        metrics = {"iou": [], "f1": [], "fpr": [], "fnr": []}
+        
+        for cls in range(1, self.config.NUM_CLASSES):
+            pred_cls = (pred == cls).float()
+            target_cls = (target == cls).float()
+            
+            tp = (pred_cls * target_cls).sum().item()
+            fp = (pred_cls * (1 - target_cls)).sum().item()
+            fn = ((1 - pred_cls) * target_cls).sum().item()
+            tn = ((1 - pred_cls) * (1 - target_cls)).sum().item()
+            
+            if tp + fp + fn < 10:  # Filter extremely small regions
+                continue
+            
+            # IoU
+            iou = tp / (tp + fp + fn + 1e-6)
+            metrics["iou"].append(iou)
+            
+            # F1
+            precision = tp / (tp + fp + 1e-6)
+            recall = tp / (tp + fn + 1e-6)
+            f1 = 2 * precision * recall / (precision + recall + 1e-6)
+            metrics["f1"].append(f1)
+            
+            # FPR/FNR
+            fpr = fp / (fp + tn + 1e-6) * 100 if (fp + tn) > 0 else 0.0
+            fnr = fn / (fn + tp + 1e-6) * 100 if (fn + tp) > 0 else 0.0
+            metrics["fpr"].append(fpr)
+            metrics["fnr"].append(fnr)
+        
+        avg_metrics = {
+            "iou": np.mean(metrics["iou"]) if metrics["iou"] else 0.0,
+            "iou_std": np.std(metrics["iou"]) if metrics["iou"] else 0.0,
+            "f1": np.mean(metrics["f1"]) if metrics["f1"] else 0.0,
+            "f1_std": np.std(metrics["f1"]) if metrics["f1"] else 0.0,
+            "fpr": np.mean(metrics["fpr"]) if metrics["fpr"] else 0.0,
+            "fnr": np.mean(metrics["fnr"]) if metrics["fnr"] else 0.0
+        }
+        
+        return avg_metrics
+    
+    def _forward_pass(self, images, point_coords, point_labels, masks, is_train=True):
+        """Forward pass (optimized version)"""
+        # 1. Image encoding
+        image_embeddings = self.sam.image_encoder(images)
+        
+        # 2. Prompt encoding (more robust batch processing)
+        B = images.shape[0]
+        
+        # Handle batch dimension
+        if point_coords.dim() == 2:
+            point_coords = point_coords.unsqueeze(0).repeat(B, 1, 1)
+        if point_labels.dim() == 1:
+            point_labels = point_labels.unsqueeze(0).repeat(B, 1)
+        
+        # Normalize coordinates to [0,1]
+        H, W = images.shape[2], images.shape[3]
+        point_coords_normalized = point_coords / torch.tensor([[W, H]], device=self.config.DEVICE).float()
+        
+        # SAM prompt encoding
+        sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(
+            points=(point_coords_normalized, point_labels),
+            boxes=None,
+            masks=None,
+        )
+        
+        # 3. Mask decoding
+        low_res_masks, _ = self.sam.mask_decoder(
+            image_embeddings=image_embeddings,
+            image_pe=self.sam.prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse_embeddings,
+            dense_prompt_embeddings=dense_embeddings,
+            multimask_output=False,
+        )
+        
+        # 4. Multi-class prediction
+        pred_masks = self.class_head(low_res_masks)
+        
+        # 5. Calculate loss (increased weight for DiceLoss)
+        ce_loss = self.ce_loss(pred_masks, masks)
+        dice_loss = self._multiclass_dice_loss(pred_masks, masks)
+        loss = 0.5 * ce_loss + 0.5 * dice_loss  # Balance CE and Dice loss
+        
+        # Backward propagation
+        if is_train:
+            self.optimizer.zero_grad()
+            if self.config.DEVICE == "cuda" and self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(self.optimizer.param_groups[0]['params'], max_norm=self.config.GRAD_CLIP)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.optimizer.param_groups[0]['params'], max_norm=self.config.GRAD_CLIP)
+                self.optimizer.step()
+        
+        return loss, pred_masks
+    
+    def train_one_epoch(self, loader, epoch):
+        self.sam.train()
+        self.class_head.train()
+        total_loss = 0.0
+        all_metrics = []
+        
+        pbar = tqdm(loader, desc=f"Epoch [{epoch+1}/{self.config.EPOCHS}] Train")
+        for batch in pbar:
+            images = batch["image"]
+            point_coords = batch["point_coords"]
+            point_labels = batch["point_labels"]
+            masks = batch["mask"]
+            
+            if torch.all(masks == 0):
+                continue
+            
+            # Mixed precision training
+            if self.config.DEVICE == "cuda" and self.scaler is not None:
+                with autocast(dtype=torch.float16):
+                    loss, pred_masks = self._forward_pass(images, point_coords, point_labels, masks, is_train=True)
+            else:
+                loss, pred_masks = self._forward_pass(images, point_coords, point_labels, masks, is_train=True)
+            
+            # Calculate metrics
+            metrics = self._calculate_metrics(pred_masks, masks)
+            all_metrics.append(metrics)
+            
+            total_loss += loss.item()
+            pbar.set_postfix({
+                "Loss": f"{loss.item():.4f}",
+                "IoU": f"{metrics['iou']:.4f}",
+                "F1": f"{metrics['f1']:.4f}"
+            })
+        
+        if len(all_metrics) == 0:
+            return 0.0, 0.0
+        
+        avg_loss = total_loss / len(all_metrics)
+        avg_iou = np.mean([m["iou"] for m in all_metrics])
+        avg_iou_std = np.std([m["iou"] for m in all_metrics])
+        avg_f1 = np.mean([m["f1"] for m in all_metrics])
+        avg_f1_std = np.std([m["f1"] for m in all_metrics])
+        
+        print(f"📊 Training set | Loss: {avg_loss:.4f} | IoU: {avg_iou:.4f} ± {avg_iou_std:.2f} | F1: {avg_f1:.4f} ± {avg_f1_std:.2f}")
+        return avg_loss, avg_iou
+    
+    @torch.no_grad()
+    def validate(self, loader):
+        self.sam.eval()
+        self.class_head.eval()
+        total_loss = 0.0
+        all_metrics = []
+        
+        pbar = tqdm(loader, desc="Validation")
+        for batch in pbar:
+            images = batch["image"]
+            point_coords = batch["point_coords"]
+            point_labels = batch["point_labels"]
+            masks = batch["mask"]
+            
+            if torch.all(masks == 0):
+                continue
+            
+            # Forward pass (no training)
+            if self.config.DEVICE == "cuda" and self.scaler is not None:
+                with autocast(dtype=torch.float16):
+                    loss, pred_masks = self._forward_pass(images, point_coords, point_labels, masks, is_train=False)
+            else:
+                loss, pred_masks = self._forward_pass(images, point_coords, point_labels, masks, is_train=False)
+            
+            # Calculate metrics
+            metrics = self._calculate_metrics(pred_masks, masks)
+            all_metrics.append(metrics)
+            
+            total_loss += loss.item()
+            pbar.set_postfix({
+                "Loss": f"{loss.item():.4f}",
+                "IoU": f"{metrics['iou']:.4f}",
+                "FNR": f"{metrics['fnr']:.1f}%"
+            })
+        
+        if len(all_metrics) == 0:
+            return 0.0, 0.0
+        
+        avg_loss = total_loss / len(all_metrics)
+        avg_iou = np.mean([m["iou"] for m in all_metrics])
+        avg_iou_std = np.std([m["iou"] for m in all_metrics])
+        avg_f1 = np.mean([m["f1"] for m in all_metrics])
+        avg_f1_std = np.std([m["f1"] for m in all_metrics])
+        avg_fpr = np.mean([m["fpr"] for m in all_metrics])
+        avg_fnr = np.mean([m["fnr"] for m in all_metrics])
+        
+        print(f"📊 Validation set | Loss: {avg_loss:.4f} | IoU: {avg_iou:.4f} ± {avg_iou_std:.2f} | F1: {avg_f1:.4f} ± {avg_f1_std:.2f} | FPR: {avg_fpr:.1f}% | FNR: {avg_fnr:.1f}%")
+        return avg_loss, avg_iou
+    
+    def train(self, train_loader, val_loader):
+        print(f"\n🚀 Start training SAM-ViT-B model | Device: {self.config.DEVICE} | Input size: {self.config.IMG_SIZE}×{self.config.IMG_SIZE}")
+        print(f"📌 Training set: {len(train_loader.dataset)} samples | Validation set: {len(val_loader.dataset)} samples")
+        
+        for epoch in range(self.config.EPOCHS):
+            # Training phase
+            train_loss, train_iou = self.train_one_epoch(train_loader, epoch)
+            
+            # Validation phase
+            val_loss, val_iou = self.validate(val_loader)
+            
+            # Learning rate scheduling
+            self.scheduler.step()
+            
+            # Save best model
+            if val_iou > self.best_val_iou:
+                self.best_val_iou = val_iou
+                self.epochs_no_improve = 0
+                save_dict = {
+                    'sam_state_dict': self.sam.state_dict(),
+                    'class_head_state_dict': self.class_head.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'best_iou': self.best_val_iou,
+                    'epoch': epoch
+                }
+                save_path = os.path.join(self.config.SAVE_DIR, self.config.BEST_MODEL_NAME)
+                torch.save(save_dict, save_path)
+                print(f"✅ Save best model (IoU: {val_iou:.4f}) | Path: {save_path}")
+            else:
+                self.epochs_no_improve += 1
+                print(f"⚠️  No improvement in validation IoU ({self.epochs_no_improve}/{self.config.PATIENCE})")
+            
+            # Early stopping
+            if self.epochs_no_improve >= self.config.PATIENCE:
+                print(f"\n⏹️  Early stopping triggered, training ended!")
+                break
+        
+        print(f"\n========== Final Results ==========")
+        print(f"📈 Best validation IoU: {self.best_val_iou:.4f}")
+        self._test_external_datasets()
+    
+    def _test_external_datasets(self):
+        """External dataset transferability validation (fixed zip error)"""
+        print(f"\n========== External Dataset Validation ==========")
+        self.sam.eval()
+        predictor = SamPredictor(self.sam)
+        
+        for idx, dataset_path in enumerate(self.config.EXTERNAL_DATASETS):
+            img_dir = os.path.join(dataset_path, "images")
+            mask_dir = os.path.join(dataset_path, "masks")
+            
+            if not os.path.exists(img_dir) or not os.path.exists(mask_dir):
+                print(f"🌍 Dataset {idx+1} | Path does not exist, skipped")
+                continue
+            
+            test_imgs = []
+            test_masks = []
+            for img_name in os.listdir(img_dir):
+                if img_name.lower().endswith((".jpg", ".png", ".jpeg")):
+                    img_path = os.path.join(img_dir, img_name)
+                    mask_prefix = os.path.splitext(img_name)[0]
+                    mask_candidates = [f for f in os.listdir(mask_dir) if f.startswith(mask_prefix) and f.endswith(".png")]
+                    if mask_candidates:
+                        test_imgs.append(img_path)
+                        test_masks.append(os.path.join(mask_dir, mask_candidates[0]))
+            
+            if len(test_imgs) == 0:
+                print(f"🌍 Dataset {idx+1} | No valid samples, skipped")
+                continue
+            
+            # Fix: zip requires test_imgs and test_masks to be passed together
+            iou_list = []
+            # Validate first 10 samples
+            for img_path, mask_path in zip(test_imgs[:10], test_masks[:10]):
+                try:
+                    img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+                    mask = cv2.imdecode(np.fromfile(mask_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+                    
+                    if img is None or mask is None:
+                        continue
+                    
+                    img = cv2.resize(img, (self.config.IMG_SIZE, self.config.IMG_SIZE))
+                    mask = cv2.resize(mask, (self.config.IMG_SIZE, self.config.IMG_SIZE), interpolation=cv2.INTER_NEAREST)
+                    
+                    predictor.set_image(img)
+                    cls_ids = np.unique(mask)
+                    cls_ids = cls_ids[cls_ids != 0]
+                    
+                    if len(cls_ids) > 0:
+                        target_cls = cls_ids[0]
+                        y_coords, x_coords = np.where(mask == target_cls)
+                        if len(y_coords) > 0:
+                            # Optimization: use multiple points for prediction
+                            points = []
+                            if len(y_coords) >= 3:
+                                rand_indices = np.random.choice(len(y_coords), 3, replace=False)
+                            else:
+                                rand_indices = np.arange(len(y_coords))
+                            
+                            for idx_rand in rand_indices:
+                                points.append([x_coords[idx_rand], y_coords[idx_rand]])
+                            
+                            point = np.array(points)
+                            labels = np.ones(len(points))
+                            
+                            pred_masks, _, _ = predictor.predict(point, labels, multimask_output=False)
+                            pred_mask = (pred_masks[0] > 0.5).astype(np.uint8) * target_cls
+                            
+                            intersection = np.logical_and(pred_mask == target_cls, mask == target_cls)
+                            union = np.logical_or(pred_mask == target_cls, mask == target_cls)
+                            iou = np.sum(intersection) / (np.sum(union) + 1e-6)
+                            iou_list.append(iou)
+                except Exception as e:
+                    print(f"🌍 Dataset {idx+1} Sample {os.path.basename(img_path)} processing failed: {str(e)}")
+                    continue
+            
+            avg_iou = np.mean(iou_list) if iou_list else 0.0
+            print(f"🌍 Dataset {idx+1} | Test samples: {len(iou_list)} | Average IoU: {avg_iou:.4f}")
+
+# ---------------- ✅ Main Function ----------------
+if __name__ == "__main__":
+    try:
+        config = Config()
+        train_loader, val_loader = load_data(config)
+        tuner = SAMFineTuner(config)
+        tuner.train(train_loader, val_loader)
+        
+        print(f"\n🎉 Training completed!")
+        print(f"✅ Best model path: {os.path.join(config.SAVE_DIR, config.BEST_MODEL_NAME)}")
+    except Exception as e:
+        print(f"\n❌ Training error: {str(e)}")
+        import traceback
+        traceback.print_exc()
