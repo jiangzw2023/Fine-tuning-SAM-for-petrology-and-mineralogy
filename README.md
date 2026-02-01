@@ -1,2 +1,2 @@
-# Fine-tuning-SAM-for-petrology-and-mineralogy
-A fine-tuning strategy for the SAM to enable the automatic segmentation (with or without prompts) and quantitative analysis of five key petrological components—grains, matrix, cement, primary pores, and dissolved pores (along with grain size, sorting, and average pore diameter)—in carbonate rock thin sections.
+# SAM-Finetuning for Carbonate Textural Component Segmentation
+This repository contains the code for fine-tuning the Segment Anything Model (SAM) to segment and quantify five key carbonate textural components (Grain, Cement, Matrix, Primary Pore, Dissolved Pore) from plane-polarized light photomicrographs — corresponding to the statement: *"The SAM was employed to segment and quantify textural components in 2,260 plane-polarized light photomicrographs derived from 414 core samples."*
